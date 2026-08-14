@@ -244,8 +244,3 @@ def dive_velocity_px(
 
 
 
-def _box_size(box: tuple[int, int, int, int]) -> tuple[float, float]:
-    return float(max(box[2] - box[0], 1)), float(max(box[3] - box[1], 1))
-
-
-

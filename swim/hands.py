@@ -24,6 +24,10 @@ from .vlm import *  # noqa: F401,F403
 from .tracking import *  # noqa: F401,F403
 
 
+def _box_size(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    return float(max(box[2] - box[0], 1)), float(max(box[3] - box[1], 1))
+
+
 def _hand_box_is_plausible(
     box: tuple[int, int, int, int],
     leave_scale: float,
