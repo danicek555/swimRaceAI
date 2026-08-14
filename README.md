@@ -10,7 +10,7 @@ cp .env.example .env
 # put OPENAI_API_KEY=sk-... in .env (needed for vision-LM leave detection)
 ```
 
-Put race videos in `videos/`. Model weights (`.pt`) download on first run and are not committed.
+Put race videos in `videos/` (sample clips `test1.mp4` and `test2.mp4` are included). Model weights (`.pt`) download on first run and are not committed.
 
 ## Run
 
