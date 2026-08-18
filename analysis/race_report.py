@@ -25,6 +25,7 @@ from speed_tempo import (
     compute_speed,
     compute_tempo,
     detect_events,
+    load_camera_track,
     load_rows,
     poseable_mask,
     render,
@@ -51,6 +52,8 @@ def main() -> None:
     parser.add_argument("--dir", required=True, help="output/<video_stem> folder")
     parser.add_argument("--lane", type=int, required=True)
     parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--use-camera", action="store_true",
+                        help="experimental: apply camera_track.csv (mid-pool only)")
     args = parser.parse_args()
 
     out_dir = Path(args.dir)
@@ -61,6 +64,16 @@ def main() -> None:
 
     data = load_rows([Path(p) for p in files])
     t_all = data["t"]
+
+    # Camera correction is OPT-IN: the translation-only model with a scalar
+    # px/m was proven insufficient near the walls (perspective anisotropy
+    # along the pool axis erases turns instead of revealing them). It stays
+    # available for mid-pool experiments, never as a silent default.
+    camera = None
+    if args.use_camera:
+        camera = load_camera_track(out_dir / "camera_track.csv")
+        if camera is not None:
+            print("camera track: pool-fixed x AKTIVNI (experimentalni)")
 
     # Blocks: contiguous in time AND split at camera cuts (a cut is a
     # reframing — stitching across it fakes reversals).
@@ -86,7 +99,7 @@ def main() -> None:
         if track_frac < MIN_BLOCK_TRACKING:
             print(f"{span:>16} | {100*track_frac:5.0f}% | {'VYRAZEN':>8} | (degenerovany blok)")
             continue
-        bsp = compute_speed(block, args.fps)
+        bsp = compute_speed(block, args.fps, camera=camera)
         bte = compute_tempo(block, bsp["direction"])
         bev = detect_events(block, bsp)
         good = bsp["speed"][~np.isnan(bsp["speed"])]

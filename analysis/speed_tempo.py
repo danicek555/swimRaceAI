@@ -79,10 +79,36 @@ def rolling_mean(values: np.ndarray, k: int) -> np.ndarray:
     return out
 
 
-def compute_speed(data: dict[str, np.ndarray], fps_hint: float) -> dict:
-    """v(t) in m/s from the smoothed center + the lane scale in the CSV."""
+def load_camera_track(path: Path) -> dict[str, np.ndarray] | None:
+    """Sidecar CSV written by swim/registration.py (t, cam_dx_px)."""
+    if not path.is_file():
+        return None
+    import csv as _csv
+
+    ts, dxs = [], []
+    with open(path, newline="") as handle:
+        for row in _csv.DictReader(handle):
+            ts.append(float(row["time_s"]))
+            dxs.append(float(row["cam_dx_px"]))
+    if not ts:
+        return None
+    return {"t": np.asarray(ts), "cam_dx": np.asarray(dxs)}
+
+
+def compute_speed(
+    data: dict[str, np.ndarray],
+    fps_hint: float,
+    camera: dict[str, np.ndarray] | None = None,
+) -> dict:
+    """v(t) in m/s from the smoothed center + the lane scale in the CSV.
+
+    With a camera track, positions move to POOL-fixed x (image + camera
+    pan) — speeds become absolute and turns visible even under a pan.
+    """
     t = data["t"]
     cx = 0.5 * (data["sx1"] + data["sx2"])
+    if camera is not None:
+        cx = cx + np.interp(t, camera["t"], camera["cam_dx"])
     width = data["sx2"] - data["sx1"]
 
     ppm_raw = width / data["length_m"]  # px per meter where length_m exists
@@ -128,8 +154,25 @@ def compute_speed(data: dict[str, np.ndarray], fps_hint: float) -> dict:
     hole[:-1] |= dt > 0.5
     hole[1:] |= dt > 0.5
     speed[hole] = np.nan
-    direction = np.sign(rolling_mean(v_px, int(1.0 * fps_hint)))
-    return {"speed": speed, "ppm": ppm, "direction": direction, "cx": cx}
+    # Direction and integrated position must use the SAME masked velocity
+    # as `speed` — the raw gradient still contains PREDICTED coasting and
+    # re-seed spikes, and integrating those fabricates meters exactly where
+    # the swimmer is hardest to see (turns).
+    v_masked = np.where(np.isnan(speed), np.nan, v_px)
+    direction = np.sign(rolling_mean(v_masked, int(1.0 * fps_hint)))
+    # Pool position in METERS by integrating displacements with the LOCAL
+    # scale. Dividing an absolute pixel position by local px/m is invalid:
+    # with camera offsets of +-2000 px, every ppm wobble fabricates meters.
+    dt = np.gradient(t)
+    step_m = np.where(np.isnan(v_masked), 0.0, v_px / ppm * dt)
+    cx_m = np.cumsum(step_m)
+    return {
+        "speed": speed,
+        "ppm": ppm,
+        "direction": direction,
+        "cx": cx,
+        "cx_m": cx_m,
+    }
 
 
 def compute_tempo(data: dict[str, np.ndarray], direction: np.ndarray) -> dict:
@@ -233,7 +276,7 @@ def detect_events(data: dict[str, np.ndarray], speed: dict) -> dict:
                         last_sign = s
                         i += 1
                         continue
-                    cx_m = speed["cx"] / speed["ppm"]
+                    cx_m = speed["cx_m"]
                     before = cx_m[max(0, i - ctx) : i + 1]
                     after = cx_m[i : i + ctx]
                     before = before[~np.isnan(before)]
@@ -487,6 +530,11 @@ def main() -> None:
         default="",
         help="comma-separated camera-cut times; blocks are split there too",
     )
+    parser.add_argument(
+        "--camera",
+        default="",
+        help="camera_track.csv from swim/registration.py (pool-fixed x)",
+    )
     parser.add_argument("--selftest", action="store_true")
     args = parser.parse_args()
 
@@ -503,6 +551,9 @@ def main() -> None:
     # fakes reversals (reframing) — so compute speed/tempo/events PER
     # contiguous block and concatenate for display.
     t_all = data["t"]
+    camera_track = load_camera_track(Path(args.camera)) if args.camera else None
+    if camera_track is not None:
+        print(f"camera track: {len(camera_track['t'])} snimku (pool-fixed x)")
     split_times = [float(x) for x in args.split_at.split(",") if x.strip()]
     cut_idx = {int(np.searchsorted(t_all, ct)) for ct in split_times}
     boundaries = sorted(
@@ -521,7 +572,7 @@ def main() -> None:
         if b - a < 20:
             continue
         block = slice_data(a, b)
-        bsp = compute_speed(block, args.fps)
+        bsp = compute_speed(block, args.fps, camera=camera_track)
         bte = compute_tempo(block, bsp["direction"])
         bev = detect_events(block, bsp)
         all_events["turns"] += bev["turns"]

@@ -233,3 +233,28 @@ v detailu neověřitelná).
 
 Výsledky: střih 5 TRACKING **9 % → 95 %**, LOST 27 % → 0 %. Regrese
 širokého záběru (střih 3): 80/20/0 — beze změny proti baseline.
+
+---
+
+# Fáze 6b — sondy kotev pro homografii (s doménovou znalostí uživatele)
+
+Mapa značek na lanech (potvrzeno uživatelem + měřením):
+**5 m** souvislá červená zóna u stěny (změřeno 5,1 m na t=22!),
+**15 m** malý červený flíček (~0,5–0,8 m), **25 m** větší červený úsek
+(~1,2–2,1 m). Vlaječky visí nad 5m čarou (mimo rovinu hladiny — jen
+kontrola, ne kotva).
+
+## Výsledky sond
+- Přechody žlutá/modrá→červená detekovatelné (hue skoky d70–85), ale
+  per-frame jich je málo (1–3 klasifikovatelné značky) a zóny u okraje
+  snímku nelze klasifikovat délkou (uřízlé). Část lan značky nenese.
+- Stěna přes vodní masku: RMS ~400 px (gejzíry, plavci) — nepoužitelné.
+- Konce lan: matou červené obrátkové panely a off-frame stěny.
+
+## Architektura 6b (z dat, ne z dojmu)
+**Klíčové snímky + řetězení:** homografii počítat jen na snímcích
+s bohatými kotvami (≥2 klasifikované značky nebo celá 5m zóna), mezi nimi
+řetězit změřeným camera trackem (validovaný, MAD <2 px). Absolutní kotvy
+drží dlouhé úseky — značka viditelná 100+ snímků průběžně přišpendluje
+řetěz. Odhad: 1–2 dny soustředěné práce (klasifikace značek robustně,
+temporální asociace, řetězení homografií, validace na obrátce 100 m).
