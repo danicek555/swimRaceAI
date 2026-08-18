@@ -171,6 +171,26 @@ def compute_tempo(data: dict[str, np.ndarray], direction: np.ndarray) -> dict:
     return {"t": np.array(times), "cycles_per_min": np.array(rates)}
 
 
+def poseable_mask(
+    t: np.ndarray,
+    tempo: dict,
+) -> np.ndarray:
+    """Per-frame pose-zone flag from PASSED tempo windows.
+
+    A tempo window that passed the FFT prominence gate is a *certificate*
+    that rhythmic stroking covers [center - win/2, center + win/2]. That is
+    a far stronger periodicity test than any per-frame score: an offline
+    calibration showed per-frame autocorrelation cannot separate stroking
+    from turns on far lanes (medians 0.21 vs 0.09), while the window gate
+    validated tempo across the whole race.
+    """
+    half = 0.5 * TEMPO_WINDOW_SECONDS
+    mask = np.zeros(len(t), dtype=bool)
+    for tc in tempo["t"]:
+        mask |= (t >= tc - half) & (t <= tc + half)
+    return mask
+
+
 def detect_events(data: dict[str, np.ndarray], speed: dict) -> dict:
     """Race events from signals already in the CSV.
 
@@ -533,6 +553,29 @@ def main() -> None:
               f"({te['t'].size} windows)")
     else:
         print("tempo: no confident windows")
+
+    poseable = poseable_mask(data["t"], te)
+    # A 5 s certificate bridges short turns — subtract detected events and
+    # non-tracking states; those are never pose material.
+    poseable &= data["state"] == "TRACKING"
+    for turn_t in all_events["turns"]:
+        poseable &= ~((data["t"] >= turn_t - 1.5) & (data["t"] <= turn_t + 1.5))
+    for a, b in all_events["underwater"]:
+        poseable &= ~((data["t"] >= a) & (data["t"] <= b))
+    old_flag = data["no_pose"] == 1
+    n = len(data["t"])
+    print(
+        f"pose zones: poseable {100*poseable.mean():.0f}% of frames "
+        f"(appearance flag said no_pose {100*old_flag.mean():.0f}%)"
+    )
+    zones_path = Path(args.out) / "pose_zones.csv"
+    with open(zones_path, "w") as zf:
+        zf.write("time_s,poseable,glide_appearance\n")
+        for i in range(n):
+            zf.write(
+                f"{data['t'][i]:.3f},{int(poseable[i])},{int(old_flag[i])}\n"
+            )
+    print(f"zones: {zones_path}")
 
     events = all_events
     for turn_t in events["turns"]:

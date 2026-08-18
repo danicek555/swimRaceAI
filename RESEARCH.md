@@ -183,3 +183,24 @@ Výsledek: tempo kontinuálně přes celý závod (motýlek≈48 → znak≈62 �
 prsa≈40 c/min), rychlost průměr 1,12 m/s s poctivo přiznanými dírami.
 Obrátky: 150 m ✓ (100,7 s); 50 m a 100 m maskovány panem kamery —
 registrace do souřadnic bazénu je jednoznačně další odemykací krok.
+
+---
+
+# Implementace z analýzy (1+2+3) — výsledky testů
+
+1. **Pose zóny z certifikátů periodicity (místo pěna+kontrast):** prošlá
+   tempo okna = důkaz rytmického plavání; mínus obrátky ±1,5 s, podvodní
+   úseky a ne-TRACKING stavy. Test: znak 68 % → **78 % použitelných
+   snímků** (vyloučené jsou nyní obrátky, ne hladina); prsa poseable 83 %
+   a okolí obrátky správně 0 %. Per-frame autokorelace zavržena měřením
+   (SNR: rytmus 0,21 vs. obrátka 0,09 — neseparuje).
+2. **Zahuštění SAM 3 skenů u krátkých záběrů: NEGATIVNÍ výsledek.**
+   12 skenů navíc na střihu 7 nenašlo nic — splývající prsař je pro
+   text-detektor neviditelný; LOST zůstal ~40 % (variance mezi běhy).
+   Plošné zahuštění revertováno; ponecháno levné zahuštění po prvním
+   zásahu. Správné řešení do roadmapy: **cross-shot handoff** — seedovat
+   záběr z poslední známé pozice předchozího záběru, bez čekání na SAM 3.
+3. **`analysis/race_report.py`:** celý protokol jedním příkazem — auto
+   objevení CSV, střihy z cuts CSV, degenerované bloky vyřazeny podle
+   TRACK % (close-up 9 % vypadl sám), tabulka per blok + timeline PNG +
+   pose zóny.

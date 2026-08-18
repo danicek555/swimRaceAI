@@ -346,6 +346,12 @@ def find_stable_lane_seed(
     if total_frames > 0:
         scan_end = min(scan_end, total_frames)
     sample_stride = max(1, int(round(REACQUIRE_SEED_EVERY_SECONDS * fps)))
+    # NOTE: blanket denser scanning on short shots was TESTED (cut 7) and
+    # reverted — 12 extra SAM 3 scans found nothing, because a gliding
+    # breaststroker is invisible to the text detector. The bottleneck is
+    # visibility, not cadence; the real fix is a cross-shot position
+    # handoff (seed the next shot from the previous shot's last position).
+    next_scan_at = first_cut.frame_index
     capture.set(cv2.CAP_PROP_POS_FRAMES, first_cut.frame_index)
 
     tracklets: list[_CandidateTrack] = []
@@ -370,10 +376,13 @@ def find_stable_lane_seed(
         ok, frame = capture.read()
         if not ok:
             break
-        relative = frame_index - first_cut.frame_index
-        if relative % sample_stride != 0:
+        if frame_index < next_scan_at:
             frame_index += 1
             continue
+        # After the first candidate appears, densify: the 2nd confirming hit
+        # should come as soon as possible, not a full stride later.
+        stride_now = sample_stride if not tracklets else max(1, sample_stride // 2)
+        next_scan_at = frame_index + stride_now
 
         detected_ropes = detect_lane_ropes(frame, lane_count=LANE_COUNT)
         if not rope_filter_initialized:
