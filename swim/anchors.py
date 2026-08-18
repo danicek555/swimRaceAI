@@ -139,18 +139,17 @@ def anchor_columns(
             # Anchor x: the 5m zone is anchored at its POOL-side start (the
             # 5 m boundary); patches at their center.
             if kind.startswith("5m"):
-                # zone runs to the wall; the boundary is the end away from
-                # the nearer frame edge... resolved by the caller via side —
-                # store both ends, caller picks. For column fitting use the
-                # inner boundary: whichever end is farther from frame edge.
-                w = frame_bgr.shape[1]
-                x = (
-                    float(mark.x_start)
-                    if (w - mark.x_end) < mark.x_start
-                    else float(mark.x_end)
-                )
-            else:
-                x = 0.5 * (mark.x_start + mark.x_end)
+                # A full (non-truncated) 5 m zone has TWO anchors: the inner
+                # boundary at X=5 m and the wall edge at X=0 m — the wall
+                # line comes for free.
+                side = kind[-1]
+                inner = float(mark.x_end) if side == "L" else float(mark.x_start)
+                wall = float(mark.x_start) if side == "L" else float(mark.x_end)
+                for kk, xx in ((kind, inner), ("0m" + side, wall)):
+                    yy = float(ropes[mark.rope_index].y_at(xx))
+                    by_kind.setdefault(kk, []).append((xx, yy))
+                continue
+            x = 0.5 * (mark.x_start + mark.x_end)
             y = float(ropes[mark.rope_index].y_at(x))
             by_kind.setdefault(kind, []).append((x, y))
 
@@ -164,6 +163,78 @@ def anchor_columns(
         resid = P[:, 0] - A @ coef
         keep = np.abs(resid) < max(2.5 * np.median(np.abs(resid)) + 1, 15)
         if keep.sum() < 2:
+            continue
+        coef, *_ = np.linalg.lstsq(A[keep], P[keep, 0], rcond=None)
+        rms = float(np.sqrt(np.mean((P[keep, 0] - A[keep] @ coef) ** 2)))
+        if rms > 25:
+            continue
+        columns.append(
+            AnchorColumn(kind, (float(coef[0]), float(coef[1])), int(keep.sum()), rms)
+        )
+    return columns
+
+
+def anchor_columns_accumulated(
+    capture: cv2.VideoCapture,
+    t0: float,
+    fps: float,
+    ropes0: list[RopeLine],
+    cam_at,
+    span: float = 0.5,
+    step: int = 3,
+) -> list[AnchorColumn]:
+    """Columns fitted from marks ACCUMULATED over +-span seconds.
+
+    Two-point columns made the homography scale ~18% off; accumulating a
+    handful of frames (marks aligned into t0's coordinates via the camera
+    track) multiplies the points and lengthens the fit baseline.
+    """
+    all_pts: dict[str, list[tuple[float, float]]] = {}
+
+    def collect(frame_bgr, ropes, dx):
+        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+        w_img = frame_bgr.shape[1]
+        for k in range(len(ropes)):
+            for mark in red_runs_on_rope(hsv, ropes, k):
+                kind = classify_mark(mark)
+                if kind is None:
+                    continue
+                if kind in ("5m", "15m"):
+                    side = "L" if 0.5 * (mark.x_start + mark.x_end) < w_img / 2 else "R"
+                    kind = kind + side
+                if kind.startswith("5m"):
+                    side = kind[-1]
+                    pairs = (
+                        (kind, float(mark.x_end if side == "L" else mark.x_start)),
+                        ("0m" + side, float(mark.x_start if side == "L" else mark.x_end)),
+                    )
+                else:
+                    pairs = ((kind, 0.5 * (mark.x_start + mark.x_end)),)
+                for kk, xx in pairs:
+                    yy = float(ropes[k].y_at(xx))
+                    all_pts.setdefault(kk, []).append((xx + dx, yy))
+
+    cam0 = cam_at(t0)
+    for k in range(-int(span * fps), int(span * fps) + 1, step):
+        t = t0 + k / fps
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(round(t * fps)))
+        ok, frame = capture.read()
+        if not ok:
+            continue
+        d = cam_at(t) - cam0
+        ropes_t = [RopeLine(r.slope, r.intercept + r.slope * d, r.score) for r in ropes0]
+        collect(frame, ropes_t, d)
+
+    columns: list[AnchorColumn] = []
+    for kind, pts in all_pts.items():
+        if len(pts) < 3:
+            continue
+        P = np.array(pts, float)
+        A = np.vstack([P[:, 1], np.ones(len(P))]).T
+        coef, *_ = np.linalg.lstsq(A, P[:, 0], rcond=None)
+        resid = P[:, 0] - A @ coef
+        keep = np.abs(resid) < max(2.5 * np.median(np.abs(resid)) + 1, 15)
+        if keep.sum() < 3:
             continue
         coef, *_ = np.linalg.lstsq(A[keep], P[keep, 0], rcond=None)
         rms = float(np.sqrt(np.mean((P[keep, 0] - A[keep] @ coef) ** 2)))
@@ -191,7 +262,7 @@ def homography_from_anchors(
     # Distances measured from the wall the mark belongs to; converted to a
     # single axis (X from the LEFT image wall) via the side suffix.
     def pool_x_of(kind: str) -> float:
-        base = {"5m": 5.0, "15m": 15.0, "25m": 25.0}[kind.rstrip("LR")]
+        base = {"0m": 0.0, "5m": 5.0, "15m": 15.0, "25m": 25.0}[kind.rstrip("LR")]
         if kind == "25m":
             return 25.0
         side = kind[-1]

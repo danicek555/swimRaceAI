@@ -274,3 +274,17 @@ lan 23,7 vs. 20 m — 2bodové sloupce) a obrátka má dosáhnout X=0/50 m, ne
 ~15–18 m. Řešení už navržené: akumulace značek přes ±0,5 s kolem
 keyframu, obě hrany 5m zóny (přidá čáru stěny X=0 zdarma), více lan se
 značkami. Mechanismus je validovaný; zbývá přesnost.
+
+## Kalibrace 6b: měřítko vyřešeno, drift vyžaduje multi-keyframe
+
+Akumulace značek (±0,5 s, zarovnání camera trackem) + obě hrany 5m zóny:
+keyframe t=50 má sloupce 0mR/5mR (52 bodů, RMS 3–7 px) a 15mR —
+**rozpětí lan 20,0 m, chyba 0 %** (z 18–23 %).
+
+Řetězený test cut4 ale ukázal druhou lekci: JEDEN keyframe + 15 s
+jednosměrného řetězení = drift ~0,3 m/s (grafika přenosu kontaminuje
+medián panu), který otočku maskuje. Dvoukeyframový běh (52,8 + 64,3)
+otočku viděl — re-ukotvení funguje. Zbývající krok: automatický výběr
+keyframů po celém záběru + po částech řetězení s rozpuštěním reziduí
+mezi sousedními keyframy (lineární distribuce driftu). Malý, přesně
+definovaný úkol na příští session.
