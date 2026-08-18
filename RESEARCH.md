@@ -258,3 +258,19 @@ s bohatými kotvami (≥2 klasifikované značky nebo celá 5m zóna), mezi nimi
 drží dlouhé úseky — značka viditelná 100+ snímků průběžně přišpendluje
 řetěz. Odhad: 1–2 dny soustředěné práce (klasifikace značek robustně,
 temporální asociace, řetězení homografií, validace na obrátce 100 m).
+
+## Fáze 6b — PRŮLOM: obrátka 100 m poprvé viditelná
+
+Řetěz: keyframe homografie (kotvy z klasifikovaných značek lan) +
+propagace lan a sloupců camera trackem (posun úseček o pan, c'=c+m·d,
+b'=b−d). Test na cut4 (48–66 s):
+
+pool_x: 30,6 m (52,8 s, KEY) → klesá ~1,9 m/s → 18,1 m (58,8 s) →
+**24,9 m (64,3 s, KEY)** — reverz mezi 58,8–64,3 s ✓ (očekáváno ~59 s).
+Obrazová trajektorie byla monotónní (pan) — registrace otočku vrátila.
+
+Zbývající kalibrace (další krok): absolutní měřítko ~18 % vedle (rozpětí
+lan 23,7 vs. 20 m — 2bodové sloupce) a obrátka má dosáhnout X=0/50 m, ne
+~15–18 m. Řešení už navržené: akumulace značek přes ±0,5 s kolem
+keyframu, obě hrany 5m zóny (přidá čáru stěny X=0 zdarma), více lan se
+značkami. Mechanismus je validovaný; zbývá přesnost.
