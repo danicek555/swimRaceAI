@@ -204,3 +204,32 @@ registrace do souřadnic bazénu je jednoznačně další odemykací krok.
    objevení CSV, střihy z cuts CSV, degenerované bloky vyřazeny podle
    TRACK % (close-up 9 % vypadl sám), tabulka per blok + timeline PNG +
    pose zóny.
+
+## Cross-shot handoff — implementováno, otestováno
+
+Prior z disku (CSV téže dráhy TRACKING ≤2,5 s před střihem) povoluje seed
+z JEDNOHO kvalitního zásahu (conf ≥0,75, nebo ≥0,60+YOLO). Test střih 7:
+seed 82,67 s při prvním zásahu (conf 0,93) — o 0,5–1,3 s dřív než baseline.
+
+**Definitivní závěr po 3 experimentech (baseline, zahuštění, handoff):**
+LOST ~39 % na střihu 7 je limit VIDITELNOSTI splývajícího prsaře pro
+zpětný SAM 2, ne seedovací taktiky. Vedlejší přínos handoffu: blok
+79,2–84,6 s s TRACKING 54 % nově prochází prahem protokolu (40 %).
+Pro metriky lze splývavou mezeru poctivě interpolovat (splývání je
+fyzikálně koast s konstantním zpomalením) — označeno jako budoucí volba.
+
+## Single-lane režim pro close-upy — implementováno, otestováno
+
+Detektor (dvoupodmínkový, kalibrovaný měřením): žebřík selhává (geometrie
+None nebo ≤6 přímých podpor ve ≥3/4 sond) **a zároveň** málo kandidátních
+lan (medián ≤12; skutečný close-up 10,5 vs. těžký wide 14). První verze
+s jedinou podmínkou falešně chytila střih 7 — odhaleno regresí na všech
+střizích, opraveno; finální detektor 7/7.
+
+Chování CU: dominantní SAM 3 seed (největší box, conf ≥0,5, plocha ≥1,5 %
+snímku, první zásah), tracking bez žebříku/lane guardů/verifikací, výstup
+značen laneCU (protokol dráhy ho nikdy nesloučí — identita dráhy je
+v detailu neověřitelná).
+
+Výsledky: střih 5 TRACKING **9 % → 95 %**, LOST 27 % → 0 %. Regrese
+širokého záběru (střih 3): 80/20/0 — beze změny proti baseline.

@@ -315,12 +315,19 @@ def find_stable_lane_seed(
     expected_time: float | None = None,
     allow_weak_fallback: bool = True,
     yolo_model=None,
+    prior_confident: bool = False,
 ) -> ReacquireSeed | None:
     """Scan the shot with SAM 3 until a recurring, confident box appears in ``lane``.
 
     Samples about every ``REACQUIRE_SEED_EVERY_SECONDS``. Stops early once a
     tracklet has enough hits and its best confidence is at least
     ``REACQUIRE_MIN_CONFIDENCE``. YOLO, when available, vetoes foam boxes.
+
+    prior_confident: cross-shot handoff — the SAME lane was confidently
+    tracked right before this cut (proven by box CSVs on disk), so the
+    prior "an active racer is in this lane" is already strong and ONE
+    high-bar hit may seed (conf >= 0.75, or conf >= 0.60 with YOLO
+    agreement) instead of waiting a full stride for the second one.
     """
     weights = _require_sam3_weights()
     from ultralytics.models.sam import SAM3SemanticPredictor
@@ -364,6 +371,11 @@ def find_stable_lane_seed(
     max_missing = sample_stride * 2
 
     def _ready(tracklet: _CandidateTrack) -> bool:
+        if prior_confident and tracklet.hits >= 1:
+            if tracklet.best_confidence >= 0.75:
+                return True
+            if tracklet.best_confidence >= 0.60 and tracklet.yolo_hits >= 1:
+                return True
         if tracklet.hits < REACQUIRE_STABLE_HITS:
             return False
         if tracklet.best_confidence >= REACQUIRE_MIN_CONFIDENCE:
@@ -676,6 +688,8 @@ def _annotate_sam_clip(
     detect_loss: bool = False,
     verifications: tuple[LaneVerification, ...] = (),
     csv_dir: Path | None = None,
+    single_lane: bool = False,
+    label: str | None = None,
 ) -> SamClipResult:
     """Track one clip with SAM 2 from the seed box and write an annotated video.
 
@@ -720,7 +734,9 @@ def _annotate_sam_clip(
         0.55 * max(seed.box[2] - seed.box[0], seed.box[3] - seed.box[1]),
     )
     rope_filter = rope_filter or RopeTemporalFilter()
-    ropes_now: list[RopeLine] | None = list(seed.ropes)
+    ropes_now: list[RopeLine] | None = (
+        list(seed.ropes) if seed.ropes else None
+    )
     rope_filter_initialized = False
     has_tracked = False
     lost_run = 0
@@ -740,7 +756,7 @@ def _annotate_sam_clip(
         source_frame = result.orig_img
         frame = source_frame.copy()
         height, width = frame.shape[:2]
-        if not rope_filter_initialized:
+        if not rope_filter_initialized and not single_lane:
             ropes_now = rope_filter.update(list(seed.ropes), frame_width=width)
             rope_filter_initialized = True
         if writer is None:
@@ -751,7 +767,7 @@ def _annotate_sam_clip(
                 (width, height),
             )
 
-        if seen % 3 == 0:
+        if seen % 3 == 0 and not single_lane:
             # Keep detecting; the temporal filter follows real camera motion,
             # suppresses isolated bad fits, and bridges only short outages.
             detected_ropes = detect_lane_ropes(source_frame, lane_count=LANE_COUNT)
@@ -949,7 +965,7 @@ def _annotate_sam_clip(
                 closest_lane=closest_lane,
             )
         status = (
-            f"SAM3 -> SAM2 | lane {lane} | nearest={closest_lane} | "
+            f"SAM3 -> SAM2 | {'SINGLE-LANE (close-up)' if single_lane else f'lane {lane}'} | nearest={closest_lane} | "
             f"t={absolute_time:.2f}s | "
             f"{'IDENTITY DRIFT' if lost_reason == 'SAM3 identity mismatch' else ('TRACKING' if tracked else 'MASK LOST')}"
             f"{f' | laneQ={ropes_now[0].score:.2f}' if ropes_now else ' | no lane geometry'}"
@@ -985,7 +1001,8 @@ def _annotate_sam_clip(
     if box_rows:
         csv_home = csv_dir if csv_dir is not None else raw_path.parent
         run_tag = (
-            f"lane{lane}_seed{seed.time_seconds:.2f}s_dir{time_direction:+d}"
+            f"{label or f'lane{lane}'}_seed{seed.time_seconds:.2f}s"
+            f"_dir{time_direction:+d}"
         )
         csv_path = csv_home / f"{run_tag}_{raw_path.stem}_boxes.csv"
         csv_path.write_text(
@@ -1052,6 +1069,139 @@ def _video_duration_seconds(video_path: Path) -> float:
     return frames / fps if fps > 0 else 0.0
 
 
+def _close_up_shot(
+    video_path: Path,
+    first_cut: CameraCut,
+    fps: float,
+    shot_end: float,
+) -> bool:
+    """Close-up detector, measured on test2: a wide shot fits the ladder
+    with 8-9 direct rope matches; a close-up either fails to fit at all or
+    forces a ladder through only ~6 matches (and laneQ does NOT catch it).
+    """
+    from .ropes import _line_candidates, detect_lane_geometry
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return False
+    span = max(min(shot_end - first_cut.time_seconds, 2.5), 0.3)
+    suspicious = 0
+    candidate_counts: list[int] = []
+    probes = 4
+    for k in range(probes):
+        t = first_cut.time_seconds + span * (k + 0.5) / probes
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(round(t * fps)))
+        ok, frame = capture.read()
+        if not ok:
+            continue
+        candidate_counts.append(len(_line_candidates(frame)))
+        geo = detect_lane_geometry(frame, lane_count=LANE_COUNT)
+        if geo is None or geo.direct_matches <= 6:
+            suspicious += 1
+    capture.release()
+    # BOTH conditions must hold. A hard wide shot (splash/glare at a turn,
+    # e.g. cut 7) also fails the ladder fit, but it still shows MANY
+    # rope-like lines; a real close-up has few lanes in frame at all
+    # (measured medians: close-up 10.5 vs wide 14).
+    geo_bad = suspicious >= int(0.6 * probes) + 1
+    few_ropes = (
+        bool(candidate_counts)
+        and float(np.median(candidate_counts)) <= 12.0
+    )
+    return geo_bad and few_ropes
+
+
+def _find_dominant_seed(
+    video_path: Path,
+    first_cut: CameraCut,
+    fps: float,
+    scan_end_frame: int,
+) -> ReacquireSeed | None:
+    """Close-up seeding: no lane ladder exists, so take the DOMINANT
+    swimmer (the featured athlete fills the frame). First confident big
+    box seeds; identity vs a physical lane is unverified by design and the
+    output is labelled CU, never merged into a lane protocol.
+    """
+    weights = _require_sam3_weights()
+    from ultralytics.models.sam import SAM3SemanticPredictor
+
+    predictor = SAM3SemanticPredictor(
+        overrides={
+            "conf": SAM3_CONFIDENCE,
+            "task": "segment",
+            "mode": "predict",
+            "imgsz": SAM3_IMAGE_SIZE,
+            "model": str(weights),
+            "verbose": False,
+            "save": False,
+        }
+    )
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return None
+    stride = max(1, int(round(REACQUIRE_SEED_EVERY_SECONDS * fps)))
+    frame_index = first_cut.frame_index
+    seed: ReacquireSeed | None = None
+    while frame_index < scan_end_frame:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        ok, frame = capture.read()
+        if not ok:
+            break
+        h, w = frame.shape[:2]
+        print(f"  SAM 3 dominant scan t={frame_index / fps:.2f}s...", flush=True)
+        predictor.set_image(frame)
+        results = predictor(text=list(SAM3_TEXT_PROMPTS))
+        result = results[0] if isinstance(results, list) else results
+        boxes = _boxes_from_sam3_result(result)
+        big = [
+            (box, conf)
+            for box, conf in boxes
+            if conf >= 0.5
+            and (box[2] - box[0]) * (box[3] - box[1]) >= 0.015 * w * h
+        ]
+        if big:
+            big.sort(key=lambda bc: (bc[0][2] - bc[0][0]) * (bc[0][3] - bc[0][1]))
+            box, conf = big[-1]
+            seed = ReacquireSeed(
+                frame_index=frame_index,
+                time_seconds=frame_index / fps,
+                box=tuple(int(v) for v in box),
+                hits=1,
+                mean_confidence=float(conf),
+                ropes=(),
+            )
+            break
+        frame_index += stride
+    capture.release()
+    return seed
+
+
+def _lane_tracked_before(
+    out_dir: Path,
+    lane: int,
+    cut_time: float,
+    window: float = 2.5,
+) -> bool:
+    """Cross-shot prior: do box CSVs on disk prove this lane was being
+    TRACKED within ``window`` seconds before ``cut_time``? Runs are separate
+    CLI invocations, so the disk is the only state that survives."""
+    import csv as _csv
+
+    hits = 0
+    for path in out_dir.glob(f"lane{lane}_*_boxes.csv"):
+        try:
+            with open(path, newline="") as handle:
+                for row in _csv.DictReader(handle):
+                    t = float(row["time_s"])
+                    if cut_time - window <= t < cut_time and row["state"] == "TRACKING":
+                        hits += 1
+                        if hits >= 15:  # half a second of evidence
+                            return True
+        except (OSError, ValueError, KeyError):
+            continue
+    return False
+
+
 def retrack_lane_after_first_cut(
     video_path: Path,
     lane: int,
@@ -1115,14 +1265,31 @@ def retrack_lane_after_first_cut(
         f"{shot_end:.3f}s..."
     )
     yolo_model = _optional_swimmer_yolo()
-    seed = find_stable_lane_seed(
-        video_path,
-        shot_cut,
-        lane,
-        closest_lane,
-        scan_end_frame=scan_end_frame,
-        yolo_model=yolo_model,
-    )
+    out_dir = OUTPUT_FOLDER / video_path.stem
+    close_up = _close_up_shot(video_path, shot_cut, fps, shot_end)
+    if close_up:
+        print(
+            "  Close-up shot detected (lane ladder unsupported by real "
+            "ropes) — SINGLE-LANE mode: tracking the dominant swimmer, "
+            "lane identity unverified, output labelled CU."
+        )
+        seed = _find_dominant_seed(video_path, shot_cut, fps, scan_end_frame)
+    else:
+        prior = _lane_tracked_before(out_dir, lane, shot_start)
+        if prior:
+            print(
+                f"  Cross-shot prior: lane {lane} was tracked right before this "
+                "cut — a single high-confidence SAM 3 hit may seed."
+            )
+        seed = find_stable_lane_seed(
+            video_path,
+            shot_cut,
+            lane,
+            closest_lane,
+            scan_end_frame=scan_end_frame,
+            yolo_model=yolo_model,
+            prior_confident=prior,
+        )
     if seed is None:
         print(
             f"No stable lane-{lane} SAM 3 box appeared "
@@ -1148,21 +1315,23 @@ def retrack_lane_after_first_cut(
 
     out_dir = OUTPUT_FOLDER / video_path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
+    lane_label = "CU" if close_up else str(lane)
     out_path = out_dir / (
-        f"{video_path.stem}_sam3_sam2_lane{lane}_"
+        f"{video_path.stem}_sam3_sam2_lane{lane_label}_"
         f"t{shot_start:.2f}-{shot_end:.2f}s.mp4"
     )
-    _save_seed_audit(
-        video_path,
-        out_dir
-        / (
-            f"{video_path.stem}_sam3_sam2_lane{lane}_"
-            f"t{shot_start:.2f}_seed.jpg"
-        ),
-        seed,
-        lane,
-        closest_lane,
-    )
+    if not close_up:
+        _save_seed_audit(
+            video_path,
+            out_dir
+            / (
+                f"{video_path.stem}_sam3_sam2_lane{lane}_"
+                f"t{shot_start:.2f}_seed.jpg"
+            ),
+            seed,
+            lane,
+            closest_lane,
+        )
 
     start = time.perf_counter()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1195,6 +1364,8 @@ def retrack_lane_after_first_cut(
                 expected_frames=max(1, int(round(backward_duration * 30))),
                 csv_dir=out_dir,
                 skip_first_frame=True,
+                single_lane=close_up,
+                label=f"lane{lane_label}",
             )
             fps = back_result.fps
             if back_result.written > 0:
@@ -1207,7 +1378,7 @@ def retrack_lane_after_first_cut(
             f"  Precomputing SAM 3 identity checks every "
             f"{REACQUIRE_VERIFY_EVERY_SECONDS:.1f}s..."
         )
-        shot_verifications = _scan_lane_verifications(
+        shot_verifications = () if close_up else _scan_lane_verifications(
             video_path,
             seed.time_seconds,
             shot_end,
@@ -1238,13 +1409,15 @@ def retrack_lane_after_first_cut(
                 time_direction=1,
                 expected_frames=max(1, int(round(segment_duration * 30))),
                 csv_dir=out_dir,
-                detect_loss=True,
+                detect_loss=not close_up,
                 verifications=tuple(
                     verification
                     for verification in shot_verifications
                     if verification.time_seconds
                     > current_seed.time_seconds + 0.5 / fps
                 ),
+                single_lane=close_up,
+                label=f"lane{lane_label}",
             )
             fps = forward_result.fps
             if forward_result.written <= 0:
