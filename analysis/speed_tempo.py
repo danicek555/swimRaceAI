@@ -54,12 +54,15 @@ def load_rows(paths: list[Path]) -> dict[str, np.ndarray]:
         return out
 
     states = np.array([rows[t]["state"] for t in times])
+    sy1 = col("smooth_y1")
+    sy2 = col("smooth_y2")
     return {
         "t": times,
         "sx1": col("smooth_x1"),
         "sx2": col("smooth_x2"),
         "rx1": col("raw_x1"),
         "rx2": col("raw_x2"),
+        "sy_mid": 0.5 * (sy1 + sy2),
         "length_m": col("length_m"),
         "no_pose": col("no_pose"),
         "state": states,
@@ -95,10 +98,30 @@ def load_camera_track(path: Path) -> dict[str, np.ndarray] | None:
     return {"t": np.asarray(ts), "cam_dx": np.asarray(dxs)}
 
 
+def load_pool_x(path: Path, times: np.ndarray) -> np.ndarray | None:
+    """Sidecar from analysis/pool_pass.py aligned onto row times."""
+    if not path.is_file():
+        return None
+    import csv as _csv
+
+    vals: dict[float, float] = {}
+    with open(path, newline="") as handle:
+        for row in _csv.DictReader(handle):
+            if row["pool_x_m"]:
+                vals[round(float(row["time_s"]), 3)] = float(row["pool_x_m"])
+    if not vals:
+        return None
+    out = np.full(len(times), np.nan)
+    for i, t in enumerate(times):
+        out[i] = vals.get(round(float(t), 3), np.nan)
+    return out
+
+
 def compute_speed(
     data: dict[str, np.ndarray],
     fps_hint: float,
     camera: dict[str, np.ndarray] | None = None,
+    pool_x: np.ndarray | None = None,
 ) -> dict:
     """v(t) in m/s from the smoothed center + the lane scale in the CSV.
 
@@ -135,6 +158,45 @@ def compute_speed(
                 offset += step
         prev_val = cx[i]
         cx[i] -= offset
+
+    if pool_x is not None:
+        # ABSOLUTE pool meters from the keyframe-homography sidecar: the
+        # position is already in meters, so no px/m conversion happens at
+        # all — speeds are absolute and turns live at real walls.
+        pos = rolling_mean(
+            np.where(tracking, pool_x, np.nan),
+            int(SPEED_SMOOTH_SECONDS * fps_hint),
+        )
+        v_m = np.gradient(pos, t)
+        speed = np.abs(v_m)
+        speed[~tracking] = np.nan
+        spike = speed > 3.0
+        for shift in (-2, -1, 1, 2):
+            spike |= np.roll(spike, shift)
+        speed[spike] = np.nan
+        dt_h = np.diff(t)
+        hole = np.zeros(len(t), dtype=bool)
+        hole[:-1] |= dt_h > 0.5
+        hole[1:] |= dt_h > 0.5
+        speed[hole] = np.nan
+        v_masked = np.where(np.isnan(speed), np.nan, v_m)
+        direction = np.sign(rolling_mean(v_masked, int(1.0 * fps_hint)))
+        # Tempo needs the IMAGE-space direction: the leading-edge residual
+        # lives in image pixels, and under a pan the image motion can point
+        # the other way than the pool motion.
+        cx_img = rolling_mean(
+            np.where(tracking, cx, np.nan), int(SPEED_SMOOTH_SECONDS * fps_hint)
+        )
+        v_img = np.gradient(cx_img, t)
+        direction_img = np.sign(rolling_mean(v_img, int(1.0 * fps_hint)))
+        return {
+            "speed": speed,
+            "ppm": ppm,
+            "direction": direction,
+            "direction_img": direction_img,
+            "cx": cx,
+            "cx_m": np.where(np.isfinite(pos), pos, np.nan),
+        }
 
     cx_smooth = rolling_mean(np.where(tracking, cx, np.nan), int(SPEED_SMOOTH_SECONDS * fps_hint))
     v_px = np.gradient(cx_smooth, t)

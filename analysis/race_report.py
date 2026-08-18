@@ -26,6 +26,7 @@ from speed_tempo import (
     compute_tempo,
     detect_events,
     load_camera_track,
+    load_pool_x,
     load_rows,
     poseable_mask,
     render,
@@ -65,6 +66,13 @@ def main() -> None:
     data = load_rows([Path(p) for p in files])
     t_all = data["t"]
 
+    # ABSOLUTE pool coordinates from the keyframe-homography sidecar are
+    # the preferred position source when present (analysis/pool_pass.py).
+    pool_x_all = load_pool_x(out_dir / f"pool_x_lane{args.lane}.csv", t_all)
+    if pool_x_all is not None:
+        cov = float(np.isfinite(pool_x_all).mean())
+        print(f"pool registrace aktivni: pokryti {100*cov:.0f}% snimku")
+
     # Camera correction is OPT-IN: the translation-only model with a scalar
     # px/m was proven insufficient near the walls (perspective anisotropy
     # along the pool axis erases turns instead of revealing them). It stays
@@ -99,8 +107,11 @@ def main() -> None:
         if track_frac < MIN_BLOCK_TRACKING:
             print(f"{span:>16} | {100*track_frac:5.0f}% | {'VYRAZEN':>8} | (degenerovany blok)")
             continue
-        bsp = compute_speed(block, args.fps, camera=camera)
-        bte = compute_tempo(block, bsp["direction"])
+        block_pool = pool_x_all[a:b] if pool_x_all is not None else None
+        if block_pool is not None and not np.isfinite(block_pool).any():
+            block_pool = None
+        bsp = compute_speed(block, args.fps, camera=camera, pool_x=block_pool)
+        bte = compute_tempo(block, bsp.get("direction_img", bsp["direction"]))
         bev = detect_events(block, bsp)
         good = bsp["speed"][~np.isnan(bsp["speed"])]
         v_mean = float(good.mean()) if good.size else float("nan")
