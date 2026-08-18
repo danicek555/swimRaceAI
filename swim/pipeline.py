@@ -27,6 +27,10 @@ from .detect import *  # noqa: F401,F403
 from .reaction import *  # noqa: F401,F403
 from .hands import *  # noqa: F401,F403
 from .overlay import *  # noqa: F401,F403
+from .cuts import *  # noqa: F401,F403
+from .lanes import *  # noqa: F401,F403
+from .sam3_preview import *  # noqa: F401,F403
+from .reacquire import *  # noqa: F401,F403
 
 
 def find_reaction_time_hybrid(
@@ -109,25 +113,51 @@ def track_one_swimmer(
     use_vlm: bool = True,
 ) -> None:
     """
-    Find the beep, follow one swimmer with SAM 2 for TRACK_SECONDS,
-    then measure reaction time = leave-block after the beep.
+    Find the beep in the first minute, follow one swimmer with SAM 2 until the
+    first hard cut (or TRACK_SECONDS if none), then measure reaction time.
 
     Prefer vision LM leave time when an API key is set; else body-frac motion.
-    is set; otherwise fall back to body-frac motion.
     """
-    print(f"Finding start beep...")
+    print(
+        f"Finding start beep in the first {SEARCH_SECONDS:.0f} seconds..."
+    )
     beep_time = find_beep_for_video(video_path)
     if beep_time is None:
-        print("No clear beep found. Tracking will still run, but RT needs a beep.")
-    else:
-        # Time is reported later, in the tracked video's own timeline
-        # ("Beep in the tracked video: ..."), once the box frame is chosen.
-        print("Beep found.")
+        print(
+            f"No clear beep found in the first {SEARCH_SECONDS:.0f} seconds. "
+            "Start analysis stopped."
+        )
+        return
+    print(f"Beep found at {beep_time:.3f}s (source video time).")
 
-    print(f"Using only the first {TRACK_SECONDS} seconds...")
+    # The start shot ends at the first hard cut after the beep. Searching a
+    # little past SEARCH_SECONDS covers late cuts without scanning the whole
+    # race video.
+    cut_search_end = max(SEARCH_SECONDS, beep_time + 30.0)
+    print(f"Looking for the first hard cut before {cut_search_end:.1f}s...")
+    cuts = detect_cuts(video_path, max_seconds=cut_search_end)
+    first_cut = next(
+        (cut for cut in cuts if cut.time_seconds > beep_time + 0.25),
+        None,
+    )
+    if first_cut is not None:
+        track_end = first_cut.time_seconds
+        print(
+            f"First cut after the beep: {track_end:.3f}s "
+            f"(frame {first_cut.frame_index}). "
+            "Start analysis will run until that cut."
+        )
+    else:
+        track_end = max(beep_time + TRACK_SECONDS, TRACK_SECONDS)
+        print(
+            "No hard cut found after the beep; "
+            f"falling back to {track_end:.1f}s."
+        )
+
+    print(f"Using the video from 0.00s to {track_end:.2f}s...")
     with tempfile.TemporaryDirectory() as tmp:
-        clip_path = Path(tmp) / f"{video_path.stem}_first{TRACK_SECONDS}s.mp4"
-        clip_first_seconds(video_path, clip_path, TRACK_SECONDS)
+        clip_path = Path(tmp) / f"{video_path.stem}_start_{track_end:.2f}s.mp4"
+        clip_first_seconds(video_path, clip_path, track_end)
 
         total_frames, video_fps = clip_frame_count(clip_path)
 
@@ -135,7 +165,7 @@ def track_one_swimmer(
         # their blocks (easy to box the right one) and a second of stillness
         # remains before the beep for the motion baseline.
         suggest_idx = 0
-        if beep_time is not None and video_fps > 0:
+        if video_fps > 0:
             suggest_idx = max(0, int(round((beep_time - 1.0) * video_fps)))
             suggest_idx = min(suggest_idx, max(total_frames - 1, 0))
 
@@ -165,7 +195,7 @@ def track_one_swimmer(
                 f"Your box frame becomes FRAME 0 of the tracked video "
                 f"(source frame {seed_idx}); earlier frames are skipped."
             )
-        if beep_time is not None and video_fps > 0 and seed_idx > int(beep_time * video_fps):
+        if video_fps > 0 and seed_idx > int(beep_time * video_fps):
             print(
                 "Warning: the box frame is AFTER the beep — the pre-beep "
                 "stillness baseline is missing, motion refine will be rough."
@@ -175,17 +205,16 @@ def track_one_swimmer(
         # the box was drawn on. The output video starts there, so console
         # times, frame numbers, overlay times and the player position agree.
         time_base = seed_idx / video_fps if video_fps > 0 else 0.0
-        beep_clip = None if beep_time is None else beep_time - time_base
+        beep_clip = beep_time - time_base
         sam_frames = max(total_frames - seed_idx, 1)
         print(
             f"Tracked video: {sam_frames} frames, {video_fps:.1f} fps, "
             f"{sam_frames / video_fps:.2f}s (frame 0 = your box frame)."
         )
-        if beep_clip is not None:
-            print(
-                f"Beep in the tracked video: {beep_clip:.2f}s "
-                f"(frame {int(round(beep_clip * video_fps))})."
-            )
+        print(
+            f"Beep in the tracked video: {beep_clip:.2f}s "
+            f"(frame {int(round(beep_clip * video_fps))})."
+        )
 
         print(f"Tracking one swimmer inside box {box} with SAM 2...")
         print("First run downloads the SAM 2 file.")
@@ -203,7 +232,9 @@ def track_one_swimmer(
         OUTPUT_FOLDER.mkdir(exist_ok=True)
         out_dir = OUTPUT_FOLDER / video_path.stem
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{video_path.stem}_track{TRACK_SECONDS}s.mp4"
+        out_path = out_dir / (
+            f"{video_path.stem}_track_t{time_base:.2f}-{track_end:.2f}s.mp4"
+        )
 
         predictor = SAM2VideoPredictor(
             overrides={
@@ -461,7 +492,7 @@ def process_video(video_path: Path, models: dict) -> None:
         log_time("Find beep", beep_start)
 
     if beep_time is None:
-        print("No clear beep found in the first 15 seconds.")
+        print(f"No clear beep found in the first {SEARCH_SECONDS:.0f} seconds.")
     else:
         print(f"The beep occurred at {beep_time:.3f} seconds (source video time)")
 
@@ -470,12 +501,56 @@ def process_video(video_path: Path, models: dict) -> None:
 
 
 
+def detect_video_cuts(video_path: Path) -> None:
+    """Detect hard camera edits and save evidence without loading SAM or YOLO."""
+    print(f"Detecting camera cuts in: {video_path}")
+    start = time.perf_counter()
+    out_dir = OUTPUT_FOLDER / video_path.stem / "cuts"
+    cuts = detect_cuts(video_path, output_dir=out_dir)
+
+    capture = cv2.VideoCapture(str(video_path))
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    capture.release()
+    duration = frame_count / fps if frame_count > 0 else 0.0
+
+    if cuts:
+        print(f"Found {len(cuts)} hard camera cut(s):")
+        for cut in cuts:
+            print(
+                f"  {cut.time_seconds:.3f}s (frame {cut.frame_index})  "
+                f"score={cut.score:.3f}, hist={cut.hist_distance:.3f}, "
+                f"pixels={cut.pixel_difference:.3f}"
+            )
+    else:
+        print("No hard camera cuts found.")
+
+    # These independent shots are what a future multi-shot tracker should
+    # process separately. A cut time is the FIRST frame of the new shot.
+    boundaries = [0.0, *(cut.time_seconds for cut in cuts), duration]
+    print("Camera-shot segments:")
+    for segment_number, (start_time, end_time) in enumerate(
+        zip(boundaries, boundaries[1:]), start=1
+    ):
+        print(f"  shot {segment_number}: {start_time:.3f}s -> {end_time:.3f}s")
+    print(f"Audit CSV + before/after previews: {out_dir}")
+    log_time("Cut detection", start)
+
+
 def run(
     folder: str,
     video_name: str | None,
     track: bool,
     known_rt: float | None,
     use_vlm: bool,
+    detect_cuts_mode: bool = False,
+    yolo_after_cut_mode: bool = False,
+    sam3_after_cut_mode: bool = False,
+    retrack_after_cut_mode: bool = False,
+    preview_seconds: float | None = None,
+    cut_index: int = 1,
+    lane: int | None = None,
+    closest_lane: int | None = None,
 ) -> None:
     folder_path = Path(folder)
     if not folder_path.exists() or not folder_path.is_dir():
@@ -483,6 +558,61 @@ def run(
 
     run_start = time.perf_counter()
     videos = pick_video(folder_path, video_name)
+
+    if detect_cuts_mode:
+        for video_path in videos:
+            detect_video_cuts(video_path)
+        log_time("All done", run_start)
+        return
+
+    if yolo_after_cut_mode:
+        for video_path in videos:
+            preview_swimmers_after_first_cut(
+                video_path,
+                preview_seconds=preview_seconds or YOLO_SWIMMER_PREVIEW_SECONDS,
+                lane=lane,
+            )
+        log_time("All done", run_start)
+        return
+
+    if sam3_after_cut_mode:
+        if lane is None:
+            raise SystemExit(
+                "--sam3-after-cut requires --lane N "
+                f"(1=furthest from camera, {LANE_COUNT}=closest)."
+            )
+        for video_path in videos:
+            preview_sam3_after_first_cut(
+                video_path,
+                lane=lane,
+                preview_seconds=preview_seconds or YOLO_SWIMMER_PREVIEW_SECONDS,
+            )
+        log_time("All done", run_start)
+        return
+
+    if retrack_after_cut_mode:
+        if lane is None:
+            raise SystemExit(
+                "--retrack-after-cut requires --lane N "
+                f"(1=furthest from camera, {LANE_COUNT}=closest)."
+            )
+        if closest_lane not in (1, LANE_COUNT):
+            raise SystemExit(
+                "--retrack-after-cut requires --closest-lane 1 or "
+                f"{LANE_COUNT}."
+            )
+        if cut_index < 1:
+            raise SystemExit("--cut must be >= 1 (1 = first hard cut).")
+        for video_path in videos:
+            retrack_lane_after_first_cut(
+                video_path,
+                lane=lane,
+                closest_lane=closest_lane,
+                preview_seconds=preview_seconds,
+                cut_index=cut_index,
+            )
+        log_time("All done", run_start)
+        return
 
     # Click-to-follow one swimmer. Skip YOLO entirely.
     if track:

@@ -22,14 +22,29 @@ def load_dotenv_file(path: Path | None = None) -> None:
 
 load_dotenv_file()
 
-# Only look at the start of the video. The start beep should be here.
-SEARCH_SECONDS = 15
+# Look for the start beep in the first minute of audio. Broadcast intros /
+# commentary often eat the first 15s, so a longer window is safer.
+SEARCH_SECONDS = 60.0
 
 # YOLO only looks at the first 10 seconds of picture. Faster on a laptop.
 DETECT_SECONDS = 6
 
-# Click-to-track also only uses the start of the race.
-TRACK_SECONDS = 6
+# Fallback track length when no hard cut exists after the beep. Prefer the
+# first camera cut as the end of the start analysis when one is available.
+TRACK_SECONDS = 6.0
+
+# Hard camera-cut detection. Frames are downscaled before comparison, so this
+# remains cheap even for 4K video. A cut must pass BOTH the histogram and pixel
+# floors; this prevents a local splash from looking like a whole-scene edit.
+CUT_DETECT_WIDTH = 256
+CUT_DETECT_HEIGHT = 144
+CUT_HIST_MIN = 0.20
+CUT_PIXEL_MIN = 0.08
+CUT_SCORE_MIN = 0.20
+# One edit can make two adjacent frame pairs look unusual. Keep only the
+# strongest local peak and suppress another result for this many seconds.
+CUT_PEAK_RADIUS_FRAMES = 2
+CUT_MIN_GAP_SECONDS = 0.50
 
 # Official World Aquatics "reaction time" = beep -> feet LEAVE the block
 # (pressure switch), usually ~0.55-0.80s for freestyle. We approximate that
@@ -175,6 +190,79 @@ WORLD_CONFIDENCE = 0.20
 YOLO_IMAGE_SIZE = 960
 WORLD_IMAGE_SIZE = 1280
 
+# Evaluation mode after the first camera cut. This intentionally keeps every
+# raw swimmer box so the output shows false positives as well as successes;
+# filtering by a requested lane comes only after this experiment.
+#
+# Default detector: DBDoco's YOLOv5 fine-tuned for swimmers
+# (https://github.com/DBDoco/yolo-swimmer-detection, MIT). Needs the classic
+# YOLOv5 code under third_party/yolov5 — Ultralytics YOLO v8+ cannot load it.
+YOLO_SWIMMER_MODEL = Path("models/yolo_swimmer/best.pt")
+YOLOV5_REPO = Path("third_party/yolov5")
+YOLO_SWIMMER_PREVIEW_SECONDS = 30.0
+YOLO_SWIMMER_CONFIDENCE = 0.25
+YOLO_SWIMMER_IMAGE_SIZE = 960
+YOLO_SWIMMER_EVERY_N_FRAMES = 3
+
+# SAM 3 -> SAM 2 post-cut re-acquisition. SAM 3 scans the shot for "swimmer"
+# (cut -> next cut) and stops once one lane tracklet is recurring + confident;
+# SAM 2 then tracks from that seed back and forward. Sample every ~0.5s so the
+# slow SAM 3 text pass stays tractable on CPU (~8s/frame).
+REACQUIRE_STABLE_HITS = 2
+REACQUIRE_MIN_CONFIDENCE = 0.50
+REACQUIRE_MATCH_IOU = 0.15
+REACQUIRE_MATCH_CENTER_FRAME_FRAC = 0.08
+REACQUIRE_SEED_EVERY_SECONDS = 0.5
+REACQUIRE_MAX_TRACK_SECONDS = 6.0
+# A single missing SAM 2 frame is normal under spray. Re-acquire only after a
+# continuous gap, and cap the number of expensive SAM 3 retries per shot.
+REACQUIRE_LOST_SECONDS = 0.5
+REACQUIRE_MAX_RESEEDS = 3
+# SAM 3 periodically checks whether SAM 2 still overlaps a swimmer concept in
+# the requested lane. Two disagreements trigger a clean re-seed even when SAM
+# 2 still returns a non-empty mask on wake/foam.
+REACQUIRE_VERIFY_EVERY_SECONDS = 2.0
+REACQUIRE_VERIFY_MISSES = 2
+REACQUIRE_VERIFY_MIN_CONFIDENCE = 0.50
+REACQUIRE_VERIFY_CENTER_FRAME_FRAC = 0.10
+
+# Lane geometry is still detected continuously. These values only smooth its
+# presentation and reject one-off fits; a repeated new fit is accepted so a
+# real pan/zoom is followed instead of freezing the old ropes.
+ROPE_SMOOTH_ALPHA = 0.35
+ROPE_MAX_JUMP_LANE_FRAC = 0.30
+ROPE_NEW_GEOMETRY_CONFIRMATIONS = 4
+ROPE_MAX_MISSING_UPDATES = 15
+ROPE_MIN_QUALITY = 0.62
+# How much better a candidate must explain the current frame before it may
+# replace held geometry, including across a lane-numbering shift, and how many
+# consecutive updates must agree so the overlay cannot oscillate.
+ROPE_FITNESS_OVERRIDE_MARGIN = 0.05
+ROPE_FITNESS_OVERRIDE_CONFIRMATIONS = 2
+
+# A SAM 3 re-seed must remain reasonably close to the last SAM 2 position.
+# Velocity is intentionally ignored: after SAM 2 latches onto wake the speed
+# estimate is garbage and would throw away the real swimmer. Allowance grows
+# with time because the body keeps moving while the mask is missing.
+REACQUIRE_POSITION_BASE_FRAME_FRAC = 0.18
+REACQUIRE_POSITION_GROWTH_FRAME_FRAC_PER_SECOND = 0.10
+# If YOLO sees a person_swimmer in the lane, a SAM 3 box must overlap it
+# (foam veto). If YOLO sees nothing, SAM 3 is used alone.
+REACQUIRE_YOLO_OVERLAP_IOU = 0.05
+
+# SAM 3 concept segmentation. Lane ropes decide which detection is which lane.
+SAM3_MODEL = Path("sam3.pt")
+SAM3_TEXT_PROMPTS = ["swimmer"]
+SAM3_CONFIDENCE = 0.25
+# Must be a multiple of SAM 3's max stride (14).
+SAM3_IMAGE_SIZE = 644
+SAM3_EVERY_N_FRAMES = 5
+# How many seconds AFTER the first cut to run (keeps CPU runs tractable).
+SAM3_AFTER_CUT_SECONDS = 10.0
+SAM3_POOL_Y_TOP_FRAC = 0.10
+SAM3_POOL_Y_BOTTOM_FRAC = 0.78
+SAM3_NEAR_LANE_IS_BOTTOM = True
+
 # Lower iou = merge overlapping boxes more aggressively (tiles + two models).
 YOLO_IOU = 0.32
 
@@ -208,3 +296,23 @@ SAM_TRACK_MODEL = "sam2_t.pt"
 OUTPUT_FOLDER = Path("output")
 
 
+
+# --- Temporal box filter (stable crop provider for stroke/pose analysis) ---
+# The SAM box is a crop supplier, not the deliverable: pose estimation needs
+# a SMOOTH center + scale, few dropouts — not a pixel-perfect mask.
+LANE_WIDTH_M = 2.5
+# A swimmer is <= 2.2 m long; a longer box contains wake -> trim the trailing
+# side. Slack for outstretched arms + a bit of perspective error.
+BOX_MAX_LEN_M = 2.6
+# Box height cap as a multiple of the local lane width in the image.
+BOX_MAX_HEIGHT_LANES = 1.2
+# EMA weights: center follows quickly, size changes slowly (perspective).
+BOX_CENTER_ALPHA = 0.35
+BOX_SIZE_ALPHA = 0.22
+# Reject instantaneous size jumps vs the recent median (wake bloat, slivers).
+BOX_SIZE_GATE = 1.6
+# Bridge SAM dropouts by prediction for at most this long.
+BOX_PREDICT_MAX_SECONDS = 1.0
+# No-pose flag (underwater/glide): little foam AND low contrast vs the lane.
+NO_POSE_FOAM_FRAC = 0.0025  # backstroke makes little foam, but not none; 0.006 flagged 39% of a surface leg
+NO_POSE_CONTRAST_RATIO = 1.15  # contrast is far below threshold on far lanes; the foam leg is the binding one

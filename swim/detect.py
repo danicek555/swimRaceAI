@@ -26,6 +26,8 @@ except ImportError:
 from .config import *  # noqa: F401,F403
 from .utils import *  # noqa: F401,F403
 from .blocks import *  # noqa: F401,F403
+from .cuts import detect_cuts
+from .lanes import lane_band_y_range, lane_from_center_y, pick_best_for_lane
 
 
 def load_yolo_model() -> dict:
@@ -387,6 +389,357 @@ def detect_people(video_path: Path, models: dict) -> None:
 
     print(f"Most people seen in one frame: {max_people}")
     print(f"Saved boxed video in: {out_path}")
+
+
+def load_swimmer_yolov5(weights: Path | None = None):
+    """
+    Load DBDoco's YOLOv5 ``person_swimmer`` weights.
+
+    These are classic Ultralytics YOLOv5 checkpoints (not YOLO v8+), so they
+    must be loaded through ``third_party/yolov5``. The weights were pickled on
+    Windows; remapping ``WindowsPath`` → ``PosixPath`` is required on macOS.
+    """
+    import pathlib
+    import sys
+
+    import torch
+
+    weights_path = (weights or YOLO_SWIMMER_MODEL).resolve()
+    repo_path = YOLOV5_REPO.resolve()
+    if not weights_path.is_file():
+        raise FileNotFoundError(
+            f"Swimmer YOLO weights missing: {weights_path}\n"
+            "Download models/exp5/weights/best.pt from "
+            "https://github.com/DBDoco/yolo-swimmer-detection"
+        )
+    if not (repo_path / "hubconf.py").is_file():
+        raise FileNotFoundError(
+            f"YOLOv5 code missing at {repo_path}. Clone with:\n"
+            "  git clone --depth 1 https://github.com/ultralytics/yolov5.git "
+            "third_party/yolov5"
+        )
+
+    # Checkpoint contains WindowsPath objects from the original training host.
+    pathlib.WindowsPath = pathlib.PosixPath
+    if str(repo_path) not in sys.path:
+        sys.path.insert(0, str(repo_path))
+
+    from models.common import AutoShape, DetectMultiBackend
+    from utils.torch_utils import select_device
+
+    device = select_device("cpu")
+    backend = DetectMultiBackend(str(weights_path), device=device, fuse=True)
+    model = AutoShape(backend)
+    # AutoShape defaults to conf=0.25; keep our preview threshold explicit.
+    model.conf = YOLO_SWIMMER_CONFIDENCE
+    model.iou = YOLO_IOU
+    return model
+
+
+def _yolov5_boxes(model, frame: np.ndarray) -> list[tuple[list[int], float, str]]:
+    """Run one BGR frame through the YOLOv5 AutoShape model."""
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = model(rgb, size=YOLO_SWIMMER_IMAGE_SIZE)
+    boxes: list[tuple[list[int], float, str]] = []
+    if result.xyxy is None or len(result.xyxy) == 0:
+        return boxes
+    tensor = result.xyxy[0]
+    if tensor is None or len(tensor) == 0:
+        return boxes
+    names = getattr(model, "names", {}) or {}
+    for row in tensor.cpu().tolist():
+        x1, y1, x2, y2, confidence, class_id = row[:6]
+        label = names.get(int(class_id), f"class{int(class_id)}")
+        boxes.append(
+            ([int(x1), int(y1), int(x2), int(y2)], float(confidence), str(label))
+        )
+    return boxes
+
+
+def preview_swimmers_after_first_cut(
+    video_path: Path,
+    preview_seconds: float = YOLO_SWIMMER_PREVIEW_SECONDS,
+    lane: int | None = None,
+) -> Path | None:
+    """
+    Draw specialized-swimmer YOLO detections after the first camera cut.
+
+    Without ``lane``: raw evaluation (all boxes, including false positives).
+    With ``lane``: tint that lane band, gray out other detections, and highlight
+    the best box whose center falls in the requested lane
+    (8 = closest/bottom, 1 = furthest/top).
+    """
+    if preview_seconds <= 0:
+        raise ValueError("preview_seconds must be greater than zero")
+    if lane is not None and not 1 <= lane <= LANE_COUNT:
+        raise ValueError(f"lane must be in 1..{LANE_COUNT}")
+
+    print(
+        f"Finding the first camera cut inside the first "
+        f"{preview_seconds:.1f}s..."
+    )
+    cuts = detect_cuts(video_path, max_seconds=preview_seconds)
+    if not cuts:
+        print("No hard cut found in the preview window; YOLO preview skipped.")
+        return None
+    first_cut = cuts[0]
+    print(
+        f"First cut: {first_cut.time_seconds:.3f}s "
+        f"(frame {first_cut.frame_index})."
+    )
+    if lane is not None:
+        print(
+            f"Lane filter ON: lane {lane} "
+            f"({'closest/bottom' if lane == LANE_COUNT else 'furthest/top' if lane == 1 else 'mid'})."
+        )
+
+    print(
+        f"Loading specialized swimmer YOLO "
+        f"({YOLO_SWIMMER_MODEL.name}, class person_swimmer)..."
+    )
+    model = load_swimmer_yolov5()
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    fps = float(capture.get(cv2.CAP_PROP_FPS) or 30.0)
+    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_source_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    preview_frames = min(
+        max(1, int(round(preview_seconds * fps))),
+        total_source_frames if total_source_frames > 0 else 2**31 - 1,
+    )
+
+    OUTPUT_FOLDER.mkdir(exist_ok=True)
+    out_dir = OUTPUT_FOLDER / video_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    seconds_label = f"{preview_seconds:g}".replace(".", "p")
+    lane_tag = f"_lane{lane}" if lane is not None else ""
+    out_path = out_dir / (
+        f"{video_path.stem}_yolo_swimmers_after_cut"
+        f"{lane_tag}_{seconds_label}s.mp4"
+    )
+
+    band = None
+    if lane is not None:
+        band = lane_band_y_range(
+            lane,
+            height,
+            LANE_COUNT,
+            near_is_bottom=SAM3_NEAR_LANE_IS_BOTTOM,
+            pool_y_top_frac=SAM3_POOL_Y_TOP_FRAC,
+            pool_y_bottom_frac=SAM3_POOL_Y_BOTTOM_FRAC,
+        )
+
+    max_swimmers = 0
+    detection_frames = 0
+    lane_hits = 0
+    last_boxes: list[tuple[list[int], float, str]] = []
+    chosen: tuple[tuple[int, int, int, int], float] | None = None
+    start = time.perf_counter()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        raw_path = Path(tmp) / "raw_yolo_swimmers.mp4"
+        writer = cv2.VideoWriter(
+            str(raw_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            capture.release()
+            raise RuntimeError("Could not create temporary YOLO preview video")
+
+        frame_index = 0
+        while frame_index < preview_frames:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            absolute_time = frame_index / fps
+
+            if frame_index >= first_cut.frame_index:
+                relative_index = frame_index - first_cut.frame_index
+                should_detect = (
+                    relative_index % YOLO_SWIMMER_EVERY_N_FRAMES == 0
+                )
+                if should_detect:
+                    last_boxes = _yolov5_boxes(model, frame)
+                    detection_frames += 1
+                    max_swimmers = max(max_swimmers, len(last_boxes))
+                    if lane is not None:
+                        plain = [
+                            ((x1, y1, x2, y2), conf)
+                            for (x1, y1, x2, y2), conf, _label in last_boxes
+                        ]
+                        picked = pick_best_for_lane(
+                            plain,
+                            lane,
+                            height,
+                            LANE_COUNT,
+                            near_is_bottom=SAM3_NEAR_LANE_IS_BOTTOM,
+                            pool_y_top_frac=SAM3_POOL_Y_TOP_FRAC,
+                            pool_y_bottom_frac=SAM3_POOL_Y_BOTTOM_FRAC,
+                        )
+                        if picked is not None:
+                            chosen = picked
+                            lane_hits += 1
+
+                if band is not None:
+                    band_y0, band_y1 = band
+                    overlay = frame.copy()
+                    cv2.rectangle(
+                        overlay,
+                        (0, band_y0),
+                        (width - 1, band_y1),
+                        (0, 180, 255),
+                        -1,
+                    )
+                    frame = cv2.addWeighted(frame, 0.82, overlay, 0.18, 0)
+                    cv2.rectangle(
+                        frame,
+                        (0, band_y0),
+                        (width - 1, band_y1),
+                        (0, 180, 255),
+                        2,
+                    )
+
+                for (x1, y1, x2, y2), confidence, label in last_boxes:
+                    if lane is None:
+                        color = (255, 0, 255)
+                        text = f"{label} {confidence:.2f}"
+                    else:
+                        assigned = lane_from_center_y(
+                            0.5 * (y1 + y2),
+                            height,
+                            LANE_COUNT,
+                            near_is_bottom=SAM3_NEAR_LANE_IS_BOTTOM,
+                            pool_y_top_frac=SAM3_POOL_Y_TOP_FRAC,
+                            pool_y_bottom_frac=SAM3_POOL_Y_BOTTOM_FRAC,
+                        )
+                        if assigned == lane:
+                            color = (255, 0, 255)
+                            text = f"L{assigned} {confidence:.2f}"
+                        elif assigned is None:
+                            color = (80, 80, 80)
+                            text = f"? {confidence:.2f}"
+                        else:
+                            color = (160, 160, 160)
+                            text = f"L{assigned} {confidence:.2f}"
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(
+                        frame,
+                        text,
+                        (x1, max(y1 - 9, 22)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        color,
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                if chosen is not None:
+                    (x1, y1, x2, y2), confidence = chosen
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 4)
+                    cv2.putText(
+                        frame,
+                        f"LANE {lane} pick {confidence:.2f}",
+                        (x1, min(y2 + 28, height - 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+                if lane is None:
+                    status = (
+                        f"YOLO person_swimmer | t={absolute_time:.2f}s | "
+                        f"detections={len(last_boxes)}"
+                    )
+                else:
+                    status = (
+                        f"YOLO lane {lane} | t={absolute_time:.2f}s | "
+                        f"raw={len(last_boxes)} | lane_hits={lane_hits}"
+                    )
+            else:
+                waiting = (
+                    f"Waiting for first cut at {first_cut.time_seconds:.3f}s | "
+                    f"t={absolute_time:.2f}s"
+                )
+                if lane is not None:
+                    waiting += f" | target lane {lane}"
+                status = waiting
+
+            cv2.rectangle(frame, (0, 0), (width, 44), (0, 0, 0), -1)
+            cv2.putText(
+                frame,
+                status,
+                (12, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.70,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            writer.write(frame)
+            frame_index += 1
+
+            if frame_index % max(int(round(fps * 5)), 1) == 0:
+                elapsed = time.perf_counter() - start
+                remaining = (
+                    elapsed / frame_index * (preview_frames - frame_index)
+                )
+                print(
+                    f"  {frame_index}/{preview_frames} frames, "
+                    f"elapsed {format_hms(elapsed)}, "
+                    f"ETA {format_hms(remaining)}"
+                )
+
+        capture.release()
+        writer.release()
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(raw_path),
+                "-i",
+                str(video_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a?",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-t",
+                f"{frame_index / fps:.6f}",
+                "-movflags",
+                "+faststart",
+                str(out_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    log_time(
+        f"YOLO swimmer preview ({frame_index} frames; "
+        f"{detection_frames} inference frames)",
+        start,
+    )
+    print(f"Most raw swimmer boxes in one frame: {max_swimmers}")
+    if lane is not None:
+        if lane_hits == 0:
+            print(f"No YOLO boxes fell into lane {lane}.")
+        else:
+            print(f"Lane {lane} hit on {lane_hits} inference frames.")
+    print(f"Saved YOLO swimmer preview: {out_path}")
+    return out_path
 
 
 

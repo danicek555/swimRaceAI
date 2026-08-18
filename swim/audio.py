@@ -30,7 +30,7 @@ def extract_audio(input_path: Path, wav_path: Path) -> None:
         "ffmpeg",
         "-y",  # overwrite the output file if it already exists
         "-i", str(input_path),
-        "-t", str(SEARCH_SECONDS),  # only the first 15 seconds
+        "-t", str(SEARCH_SECONDS),  # only the first SEARCH_SECONDS
         "-ac", "1",  # 1 channel = mono (easier to analyze)
         "-ar", "44100",  # 44100 samples per second
         "-sample_fmt", "s16",  # a common WAV format scipy can read
@@ -45,6 +45,9 @@ def find_beep(wav_path: Path) -> float | None:
     Find when the start beep happens.
 
     Returns the time in seconds, or None if it does not find a clear beep.
+    In the first minute, broadcast intros can be louder than the starter, so
+    the loudest band-pass spike is not enough: we prefer a SHORT burst with a
+    sharp onset over sustained music / crowd noise.
     """
     # sample_rate = how many audio samples are in one second (we asked for 44100)
     # audio = a big list of numbers, one per sample
@@ -91,27 +94,56 @@ def find_beep(wav_path: Path) -> float | None:
         return None
 
     # The beep should be much louder than typical background sound.
-    # argmax = index of the biggest number. median = a typical/middle value,
-    # which is less fooled by one huge spike than an average would be.
-    peak_index = int(np.argmax(energies))
-    peak = energies[peak_index]
-    typical = np.median(energies)
-    if peak < typical * 4:
+    typical = float(np.median(energies))
+    if typical <= 0:
+        return None
+    threshold = typical * 4.0
+    window_seconds = WINDOW_MS / 1000.0
+    # About 0.5s of quiet history for the onset ratio.
+    onset_lookback = max(1, int(round(0.5 / window_seconds)))
+
+    best_index = None
+    best_score = 0.0
+    for index in range(1, len(energies) - 1):
+        peak = float(energies[index])
+        if peak < threshold:
+            continue
+        if peak < energies[index - 1] or peak < energies[index + 1]:
+            continue
+
+        # How long the tone stays hot around this peak. Music and commentary
+        # linger; a starter beep collapses within a few tenths of a second.
+        left = index
+        while left > 0 and energies[left] > peak * 0.4:
+            left -= 1
+        right = index
+        while right < len(energies) - 1 and energies[right] > peak * 0.4:
+            right += 1
+        duration = (right - left) * window_seconds
+        if duration < 0.04 or duration > 0.55:
+            continue
+
+        previous = energies[max(0, index - onset_lookback) : index]
+        baseline = float(np.median(previous)) if len(previous) else typical
+        onset = peak / max(baseline, 1e-6)
+        # Sharp, short, loud bursts win. Absolute loudness alone would pick
+        # the intro music in many broadcast files.
+        score = (peak / typical) * min(onset / 8.0, 3.0)
+        if score > best_score:
+            best_score = score
+            best_index = index
+
+    if best_index is None:
         return None
 
-    # Walk backward from the loudest moment to where the beep started.
-    # The peak is often the MIDDLE of the beep. We want the START.
-    # Keep stepping left while the slice is still at least 40% as loud as the peak.
+    # Walk backward from the chosen peak to where the beep started.
+    peak = float(energies[best_index])
     start_threshold = peak * 0.4
-    start_index = peak_index
+    start_index = best_index
     while start_index > 0 and energies[start_index] > start_threshold:
         start_index -= 1
 
-    # Convert "which window?" into seconds.
-    # Window 0 = 0.000s, window 1 = 0.020s, window 92 = 1.840s, and so on.
-    window_seconds = WINDOW_MS / 1000
-    beep_time = start_index * window_seconds
-    return beep_time
+    return start_index * window_seconds
 
 
 

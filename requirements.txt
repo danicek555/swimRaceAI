@@ -2,3 +2,6 @@ numpy
 scipy
 ultralytics
 certifi
+pandas
+timm
+# torch is required by ultralytics / the optional YOLOv5 swimmer weights

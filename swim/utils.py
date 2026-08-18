@@ -110,13 +110,17 @@ def clip_video_start(input_path: Path, clip_path: Path) -> None:
 
 
 
-def clip_first_seconds(input_path: Path, clip_path: Path, seconds: int) -> None:
+def clip_first_seconds(
+    input_path: Path,
+    clip_path: Path,
+    seconds: float,
+) -> None:
     """Copy only the first N seconds. Full frame, no crop (needed for click-to-track)."""
     command = [
         "ffmpeg",
         "-y",
         "-i", str(input_path),
-        "-t", str(seconds),
+        "-t", f"{float(seconds):.6f}",
         "-an",
         str(clip_path),
     ]

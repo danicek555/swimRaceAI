@@ -14,11 +14,14 @@
 #   swim/tracking.py  pick + follow ONE swimmer with SAM 2
 #   swim/reaction.py  reaction time = beep -> feet leave the block
 #   swim/hands.py     hand entry into the water + flight time
+#   swim/cuts.py      find hard camera edits from whole-frame changes
 #   swim/pipeline.py  glues the steps together (run, track_one_swimmer)
 #
 # What --track does, step by step:
-#   1. find_beep() listens to the audio: band-pass 800-3000 Hz, RMS loudness
-#      in 20 ms slices, walk back from the peak to the beep START.
+#   1. find_beep() listens to the first minute of audio: band-pass 800-3000 Hz,
+#      RMS loudness in 20 ms slices, walk back from the peak to the beep START.
+#      If none is found, --track stops. Otherwise SAM 2 covers the start until
+#      the first hard camera cut (fallback: TRACK_SECONDS after the beep).
 #   2. A picker window opens ~1 second BEFORE the beep (everyone is already
 #      set on the blocks). You draw a tight box around ONE swimmer.
 #   3. The frame you drew on becomes FRAME 0 of the tracked video. All times
@@ -71,10 +74,59 @@ def main() -> None:
         "--video",
         help="Optional: one video filename inside that folder",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--track",
         action="store_true",
-        help="Click one swimmer: SAM 2 tracks and measures reaction time after the beep",
+        help="Click one swimmer: SAM 2 tracks from the beep until the first cut",
+    )
+    mode.add_argument(
+        "--detect-cuts",
+        action="store_true",
+        help="Find hard camera edits and save score CSV + before/after previews",
+    )
+    mode.add_argument(
+        "--yolo-after-cut",
+        action="store_true",
+        help="Draw specialized YOLOv5 person_swimmer boxes after the first camera cut",
+    )
+    mode.add_argument(
+        "--sam3-after-cut",
+        action="store_true",
+        help="SAM 3 text='swimmer' after first cut, keep detections in --lane",
+    )
+    mode.add_argument(
+        "--retrack-after-cut",
+        action="store_true",
+        help="Use SAM 3 lane scan after a cut, then track its box with SAM 2",
+    )
+    parser.add_argument(
+        "--preview-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Absolute end time for after-cut modes. Default: 30s for previews, "
+            "and the whole shot (cut to next cut) for --retrack-after-cut"
+        ),
+    )
+    parser.add_argument(
+        "--cut",
+        type=int,
+        default=1,
+        help="Which hard cut to start from (1=first). Used by --retrack-after-cut",
+    )
+    parser.add_argument(
+        "--lane",
+        type=int,
+        default=None,
+        help="Lane number for after-cut previews (1=furthest, 8=closest to camera)",
+    )
+    parser.add_argument(
+        "--closest-lane",
+        type=int,
+        choices=(1, 8),
+        default=None,
+        help="Physical lane nearest this camera shot: 1 or 8",
     )
     parser.add_argument(
         "--known-rt",
@@ -88,7 +140,21 @@ def main() -> None:
         help="Skip vision LM; use motion-only reaction time",
     )
     args = parser.parse_args()
-    run(args.folder, args.video, args.track, args.known_rt, use_vlm=not args.no_vlm)
+    run(
+        args.folder,
+        args.video,
+        args.track,
+        args.known_rt,
+        use_vlm=not args.no_vlm,
+        detect_cuts_mode=args.detect_cuts,
+        yolo_after_cut_mode=args.yolo_after_cut,
+        sam3_after_cut_mode=args.sam3_after_cut,
+        retrack_after_cut_mode=args.retrack_after_cut,
+        preview_seconds=args.preview_seconds,
+        cut_index=args.cut,
+        lane=args.lane,
+        closest_lane=args.closest_lane,
+    )
 
 
 # This special check is True only when you run this file directly:

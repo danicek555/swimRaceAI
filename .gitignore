@@ -11,6 +11,8 @@ venv/
 runs/
 output/
 weights/
+models/
+third_party/
 *.pt
 
 # Generated / local media outside sample videos/
