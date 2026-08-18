@@ -303,3 +303,125 @@ def pool_xy(H: np.ndarray, x: float, y: float) -> tuple[float, float]:
     """Apply the homography to one image point -> pool meters."""
     p = H @ np.array([x, y, 1.0])
     return float(p[0] / p[2]), float(p[1] / p[2])
+
+
+class Keyframe(NamedTuple):
+    """One absolutely anchored frame of a shot."""
+
+    time_seconds: float
+    ropes: list[RopeLine]
+    columns: list[AnchorColumn]
+    cam_dx: float
+
+
+def find_keyframes(
+    capture: cv2.VideoCapture,
+    cam_at,
+    t_start: float,
+    t_end: float,
+    fps: float = 30.0,
+    step_seconds: float = 1.0,
+    lane_count: int = 8,
+) -> list[Keyframe]:
+    """Scan a shot for frames that can be absolutely anchored.
+
+    A keyframe needs a full rope ladder plus >= 2 accumulated anchor
+    columns. One-way chaining from a single keyframe drifts ~0.3 m/s
+    (broadcast overlay features contaminate the pan median), so DENSITY
+    of keyframes is what buys absolute accuracy between them.
+    """
+    from .ropes import detect_lane_ropes
+
+    keyframes: list[Keyframe] = []
+    for t0 in np.arange(t_start + 0.6, t_end - 0.6, step_seconds):
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(round(t0 * fps)))
+        ok, frame = capture.read()
+        if not ok:
+            continue
+        ropes = detect_lane_ropes(frame, lane_count=lane_count)
+        if len(ropes) != lane_count + 1:
+            continue
+        cols = anchor_columns_accumulated(
+            capture, float(t0), fps, list(ropes), cam_at
+        )
+        kinds = {c.kind for c in cols}
+        if len(kinds) < 2:
+            continue
+        keyframes.append(
+            Keyframe(float(t0), list(ropes), cols, float(cam_at(t0)))
+        )
+    return keyframes
+
+
+def _pool_x_from_keyframe(
+    kf: Keyframe,
+    cam_now: float,
+    x_img: float,
+    y_img: float,
+    closest_lane: int,
+) -> float | None:
+    """Pool X of an image point, keyframe propagated to the current pan."""
+    d = cam_now - kf.cam_dx
+    ropes_p = [
+        RopeLine(r.slope, r.intercept + r.slope * d, r.score) for r in kf.ropes
+    ]
+    cols_p = [
+        AnchorColumn(c.kind, (c.coef[0], c.coef[1] - d), c.points, c.rms)
+        for c in kf.columns
+    ]
+    H = homography_from_anchors(ropes_p, cols_p, closest_lane, "right")
+    if H is None:
+        return None
+    return pool_xy(H, x_img, y_img)[0]
+
+
+def pool_x_blended(
+    keyframes: list[Keyframe],
+    cam_at,
+    t: float,
+    x_img: float,
+    y_img: float,
+    closest_lane: int = 8,
+) -> float | None:
+    """Pool X at time t, blended between the neighbouring keyframes.
+
+    Forward propagation from the previous keyframe and backward from the
+    next one each carry an opposite share of the chain drift; a linear
+    blend distributes the residual — the two-keyframe experiment showed
+    exactly this re-anchoring recovers turns that one-way chaining hides.
+    """
+    if not keyframes:
+        return None
+    cam_now = float(cam_at(t))
+    before = [k for k in keyframes if k.time_seconds <= t]
+    after = [k for k in keyframes if k.time_seconds > t]
+    xs = []
+    weights = []
+    if before:
+        k1 = before[-1]
+        x1 = _pool_x_from_keyframe(k1, cam_now, x_img, y_img, closest_lane)
+        if x1 is not None:
+            xs.append(x1)
+            weights.append(
+                1.0
+                if not after
+                else (after[0].time_seconds - t)
+                / max(after[0].time_seconds - k1.time_seconds, 1e-6)
+            )
+    if after:
+        k2 = after[0]
+        x2 = _pool_x_from_keyframe(k2, cam_now, x_img, y_img, closest_lane)
+        if x2 is not None:
+            xs.append(x2)
+            weights.append(
+                1.0
+                if not before
+                else (t - before[-1].time_seconds)
+                / max(k2.time_seconds - before[-1].time_seconds, 1e-6)
+            )
+    if not xs:
+        return None
+    w = np.array(weights, float)
+    if w.sum() <= 0:
+        w = np.ones_like(w)
+    return float(np.dot(xs, w / w.sum()))

@@ -288,3 +288,24 @@ otočku viděl — re-ukotvení funguje. Zbývající krok: automatický výběr
 keyframů po celém záběru + po částech řetězení s rozpuštěním reziduí
 mezi sousedními keyframy (lineární distribuce driftu). Malý, přesně
 definovaný úkol na příští session.
+
+## Fáze 6b — DOKONČENO: multi-keyframe registrace funguje end-to-end
+
+`find_keyframes` (automatický výběr; 5 keyframů v cut4, 10 v cut8) +
+`pool_x_blended` (obousměrná propagace, lineární rozpuštění driftu).
+
+**Validace cut8 (150 m):** sestup k ~13 m, plató u stěny 97–98 s,
+obrátková zóna ~99 s, pak setrvalý výstup 27→38 m tempem 1,2–1,3 m/s —
+reverz v absolutních metrech ✓, rychlosti fyzikální ✓.
+
+**Oprava vlastní interpretace (integrita):** „průlomový reverz" na cut4
+z 2keyframového běhu byl artefakt špatného single-frame keyframu.
+Kalibrovaná multi-keyframe trajektorie cut4 je monotónní 41→20 m tempem
+~1,25 m/s (přesné znakové tempo) — obrátka na 100 m leží až v CLOSE-UPU
+(65,7–72,5 s): režie na ni střihla detail, přesně proto v širokém záběru
+chybí. Registrace tedy neodhalila chybějící obrátku, ale mou chybnou
+hypotézu o její poloze — což je rovnocenný důkaz, že měří správně.
+
+Zbytková rezidua (šum obrátkové zóny z gejzíru, stráže keyframů u okrajů
+záběru) jsou doladění, ne blokery. pool_x_m je připravené k integraci do
+race_reportu jako výchozí souřadnice.
